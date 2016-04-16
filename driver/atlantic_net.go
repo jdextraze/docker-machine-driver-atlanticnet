@@ -5,9 +5,12 @@ import (
 	"github.com/docker/machine/libmachine/drivers"
 	"github.com/docker/machine/libmachine/log"
 	"github.com/docker/machine/libmachine/mcnflag"
+	"github.com/docker/machine/libmachine/mcnutils"
+	"github.com/docker/machine/libmachine/ssh"
 	"github.com/docker/machine/libmachine/state"
 	"github.com/jdextraze/go-atlanticnet"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/user"
 	"strconv"
@@ -88,6 +91,7 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			EnvVar: "ATLANTIC_NET_SSH_KEY_ID",
 			Name:   "atlantic-net-ssh-key-id",
 			Usage:  "Atlantic.Net SSH key id",
+			Value:  "",
 		},
 		mcnflag.StringFlag{
 			EnvVar: "ATLANTIC_NET_SSH_KEY_PATH",
@@ -142,9 +146,6 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	if d.APISecret == "" {
 		return fmt.Errorf("Atlantic.Net driver requires the --atlantic-net-api-secret option")
 	}
-	if d.SSHKeyId == "" {
-		return fmt.Errorf("Atlantic.Net driver requires the --atlantic-net-ssh-key-id option")
-	}
 	return nil
 }
 
@@ -169,8 +170,17 @@ func (d *Driver) PreCreateCheck() error {
 func (d *Driver) Create() error {
 	log.Info("Creating Atlantic.Net VPS...")
 
-	if err := d.copySSHKey(); err != nil {
-		return err
+	var sshKey []byte
+	if d.SSHKeyId != "" {
+		if err := d.copySSHKey(); err != nil {
+			return err
+		}
+	} else {
+		var err error
+		sshKey, err = d.createSSHKey()
+		if err != nil {
+			return err
+		}
 	}
 
 	instance, err := d.getClient().RunInstance(atlanticnet.RunInstanceRequest{
@@ -190,6 +200,10 @@ func (d *Driver) Create() error {
 		d.InstanceID,
 		d.IPAddress,
 	)
+
+	if sshKey != nil {
+		d.addSshKeyToServer(instance[0].Password, sshKey)
+	}
 
 	return nil
 }
@@ -288,6 +302,10 @@ func (d *Driver) getClient() atlanticnet.Client {
 }
 
 func (d *Driver) validateSshKey() error {
+	if d.SSHKeyId == "" {
+		return nil
+	}
+
 	sshKeys, err := d.getClient().ListSshKeys()
 	if err != nil {
 		return err
@@ -343,4 +361,82 @@ func (d *Driver) copySSHKey() (err error) {
 	}
 	err = out.Sync()
 	return
+}
+
+func (d *Driver) publicSSHKeyPath() string {
+	return d.GetSSHKeyPath() + ".pub"
+}
+
+func (d *Driver) createSSHKey() ([]byte, error) {
+	if err := ssh.GenerateSSHKey(d.GetSSHKeyPath()); err != nil {
+		return nil, err
+	}
+
+	publicKey, err := ioutil.ReadFile(d.publicSSHKeyPath())
+	if err != nil {
+		return nil, err
+	}
+
+	return publicKey, nil
+}
+
+func (d *Driver) addSshKeyToServer(password string, sshKey []byte) error {
+	log.Info("Waiting for machine to be running, this may take a few minutes...")
+	if err := mcnutils.WaitFor(drivers.MachineInState(d, state.Running)); err != nil {
+		return fmt.Errorf("Error waiting for machine to be running: %s", err)
+	}
+
+	log.Info("Waiting for SSH to be available...")
+	if err := mcnutils.WaitFor(d.sshAvailableFunc(password)); err != nil {
+		return fmt.Errorf("Error waiting for ssh to be available: %s", err)
+	}
+
+	_, err := d.runSshCommand(
+		password,
+		"mkdir ~/.ssh && echo '"+string(sshKey)+"' >> ~/.ssh/authorized_keys",
+	)
+	return err
+}
+
+func (d *Driver) sshAvailableFunc(password string) func() bool {
+	return func() bool {
+		log.Debug("Getting to WaitForSSH function...")
+		if _, err := d.runSshCommand(password, "exit 0"); err != nil {
+			log.Debugf("Error getting ssh command 'exit 0' : %s", err)
+			return false
+		}
+		return true
+	}
+}
+
+func (d *Driver) runSshCommand(password string, cmd string) (string, error) {
+	c, err := d.getSshClient(password)
+	if err != nil {
+		return "", err
+	}
+
+	out, err := c.Output(cmd)
+	log.Debugf("Ssh command output: %s", out)
+
+	return out, err
+}
+
+func (d *Driver) getSshClient(password string) (ssh.Client, error) {
+	address, err := d.GetSSHHostname()
+	if err != nil {
+		return nil, err
+	}
+
+	port, err := d.GetSSHPort()
+	if err != nil {
+		return nil, err
+	}
+
+	auth := &ssh.Auth{
+		Passwords: []string{password},
+	}
+
+	ssh.SetDefaultClient(ssh.Native)
+
+	return ssh.NewClient(d.GetSSHUsername(), address, port, auth)
 }
